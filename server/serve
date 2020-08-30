@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 ft=sh
+
+set -e # Exit on any error. Use `COMMAND || true` to nullify
+set -E # Functions inherit error trap
+set -u # Error on unset variables. Use ${var:-alternate value} to bypass
+set -f # Error on attempted file globs (e.g. *.txt )
+set -o pipefail # Failed commands in pipes cause the whole pipe to fail
+
+LOG_LEVEL=trace
+LOG_IN_COLOR=true
+LOG_WITH_DATE=false
+
+function main()
+{
+    info "Hello!"
+    serve 80 handle
+    wait
+    return 0
+}
+
+function response_code_to_text(){
+    code="$1"
+    codes="
+        100 Continue
+        101 Switching Protocols
+        102 Processing (WebDAV)
+        200 OK
+        201 Created
+        202 Accepted
+        203 Non-Authoritative Information
+        204 No Content
+        205 Reset Content
+        206 Partial Content
+        207 Multi-Status (WebDAV)
+        208 Already Reported (WebDAV)
+        226 IM Used
+        300 Multiple Choices
+        301 Moved Permanently
+        302 Found
+        303 See Other
+        304 Not Modified
+        305 Use Proxy
+        306 (Unused)
+        307 Temporary Redirect
+        308 Permanent Redirect (experimental)
+        400 Bad Request
+        401 Unauthorized
+        402 Payment Required
+        403 Forbidden
+        404 Not Found
+        405 Method Not Allowed
+        406 Not Acceptable
+        407 Proxy Authentication Required
+        408 Request Timeout
+        409 Conflict
+        410 Gone
+        411 Length Required
+        412 Precondition Failed
+        413 Request Entity Too Large
+        414 Request-URI Too Long
+        415 Unsupported Media Type
+        416 Requested Range Not Satisfiable
+        417 Expectation Failed
+        418 I'm a teapot (RFC 2324)
+        420 Enhance Your Calm (Twitter)
+        422 Unprocessable Entity (WebDAV)
+        423 Locked (WebDAV)
+        424 Failed Dependency (WebDAV)
+        425 Reserved for WebDAV
+        426 Upgrade Required
+        428 Precondition Required
+        429 Too Many Requests
+        431 Request Header Fields Too Large
+        444 No Response (Nginx)
+        449 Retry With (Microsoft)
+        450 Blocked by Windows Parental Controls (Microsoft)
+        451 Unavailable For Legal Reasons
+        499 Client Closed Request (Nginx)
+        500 Internal Server Error
+        501 Not Implemented
+        502 Bad Gateway
+        503 Service Unavailable
+        504 Gateway Timeout
+        505 HTTP Version Not Supported
+        506 Variant Also Negotiates (Experimental)
+        507 Insufficient Storage (WebDAV)
+        508 Loop Detected (WebDAV)
+        509 Bandwidth Limit Exceeded (Apache)
+        510 Not Extended
+        511 Network Authentication Required
+        598 Network read timeout error
+        599 Network connect timeout error
+   "
+   resp_as_string=$( echo "$codes" | grep -Eie "^[[:space:]]*$code " )
+   echo "${resp_as_string#*$code }"
+}
+
+function test_response_code_to_text(){
+    local in=200
+    local expect="OK"
+    result=$( response_code_to_text "$in" )
+    if [[ $result != $expect ]]; then
+        fatal "Failed response_code_to_text test: got: $result, expected: $expect"
+    fi
+}
+
+
+function handle(){
+    declare -A headers
+    response=""
+    code=500
+
+    function set_header(){
+        headers[$1]="${2:-}"
+    }
+
+    function set_response(){
+        response="$1"
+        set_header  "Content-Length" "${#response}"
+    }
+
+    function set_code(){
+        code="$1"
+    }
+
+    function send(){
+        trace "Going to send response"
+        {
+            printf "HTTP/1.1 %d %s\n" $code "$( response_code_to_text "$code" )"
+            for h in "${!headers[@]}"; do
+                printf "%s: %s\n" "$h" "${headers[$h]}"
+            done
+            printf "\n"
+            printf "%s" "$response"
+        } 
+    }
+
+    info "Handling connection"
+    for c in "${@}"; do
+        debug "Found line: $c"
+    done
+
+    content=$( cat - )
+    debug "Content: $content"
+
+    set_code 200
+    set_header Content-Type "text/plain"
+    set_response "ok"
+    send
+}
+
+function serve(){
+    local port="${1}"
+    local command="${2}"
+    info "Going to serve on port $port"
+
+    debug "Making fifos"
+    export SERVER_IN=$( mktemp --dry-run   server_in.XXXXXXX )
+    export SERVER_OUT=$( mktemp --dry-run server_out.XXXXXXX )
+
+    mkfifo "$SERVER_IN"
+    mkfifo "$SERVER_OUT"
+
+    trace "Made fifos: in: $( ls -altr "$SERVER_IN" )"
+    trace "Made fifos: out: $( ls -altr "$SERVER_OUT" )"
+
+    function handle_conn(){
+        content_length_regex='Content-Length: ([0-9]+)'
+        content=()
+        length=0
+
+        debug "Attempting read..."
+        while read -r line || [[ -n "$line" ]]; do
+            trace "Read: $line"
+            if [[ $line == $'\r' ]]; then
+                break
+            fi
+            if [[ $line =~ $content_length_regex ]]; then
+                length="${BASH_REMATCH[1]}"
+                trace "Client sending content length of $length"
+            fi
+            content+=( "$line" )
+        done 
+        debug "Done reading"
+        cat - | head -c "$length" | "$command" "${content[@]}" 
+        debug "Done running command $command"
+    }
+
+    while true; do
+        info "Going to listen on $port"
+        cat "$SERVER_OUT" | handle_conn | nc -l -p $port > "$SERVER_OUT"
+    done
+}
+
+export LOG_LEVEL_TRACE=90 LOG_LEVEL_DEBUG=70 LOG_LEVEL_INFO=50 LOG_LEVEL_WARN=30 LOG_LEVEL_ERROR=10 LOG_LEVEL_FATAL=0
+# Colors used in log lines
+export LOG_COLORS=( [$LOG_LEVEL_TRACE]=37 [$LOG_LEVEL_DEBUG]=36 [$LOG_LEVEL_INFO]=32 [$LOG_LEVEL_WARN]=33 [$LOG_LEVEL_ERROR]=31 [$LOG_LEVEL_FATAL]=41)
+declare -A LOG_LEVEL_MAPPING
+LOG_LEVEL_MAPPING=( 
+    [trace]="$LOG_LEVEL_TRACE" [debug]="$LOG_LEVEL_DEBUG" [info]="$LOG_LEVEL_INFO" [warn]="$LOG_LEVEL_WARN" [error]="$LOG_LEVEL_ERROR" [fatal]="$LOG_LEVEL_FATAL"
+    [$LOG_LEVEL_TRACE]="trace" [$LOG_LEVEL_DEBUG]="debug" [$LOG_LEVEL_INFO]="info" [$LOG_LEVEL_WARN]="warn" [$LOG_LEVEL_ERROR]="error" [$LOG_LEVEL_FATAL]="fatal" 
+)
+
+function log(){
+    local level="$1";
+    shift 1;
+
+    local INT_LOG_LEVEL=${LOG_LEVEL_MAPPING[$LOG_LEVEL]}
+    local LEVEL_WORD=${LOG_LEVEL_MAPPING[$level]}
+
+    # Check if we should bail
+    [[ $level -le ${INT_LOG_LEVEL} ]] || return 0
+
+    # If we are using log colors, then set those here
+    local color_pre="\\e[${LOG_COLORS[$level]}m";
+    local color_post='\e[0m';
+    local date=""; $LOG_WITH_DATE && date=" $( date +%H:%M:%S.%3N )" || true
+
+    {
+        ${LOG_IN_COLOR} && echo -en "\\002$color_pre\\003";
+        echo -n "[${LEVEL_WORD: 0:4}$date]:"
+        ${LOG_IN_COLOR} && echo -en "\\002$color_post\\003";
+        echo " ${@}"
+    } >&2
+}
+
+function trace(){ log $LOG_LEVEL_TRACE "${@}"; }
+function debug(){ log $LOG_LEVEL_DEBUG "${@}"; }
+function info(){ log $LOG_LEVEL_INFO "${@}"; }
+function warn(){ log $LOG_LEVEL_WARN "${@}"; }
+function error(){ log $LOG_LEVEL_ERROR "${@}"; }
+function fatal(){ log $LOG_LEVEL_FATAL "${@}"; exit 1; return 1; }
+
+test_response_code_to_text
+main "${@}"
+
+exit $?
+

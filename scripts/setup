@@ -1,3 +1,9 @@
 #!/usr/bin/env bash
 
+set -ueo pipefail
 
+apt-get update
+
+apt-get install -y netcat xxd
+
+apt-get clean
