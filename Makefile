@@ -16,5 +16,7 @@ test: build
 	docker logs -f test-img & 
 	sleep 1
 	echo test | curl -d@- -X GET -v --max-time 5 localhost:8080 || true
+	echo test | curl -d@- -X GET -v --max-time 5 localhost:8080 || true
+	echo test | curl -d@- -X GET -v --max-time 5 localhost:8080 || true
 	docker stop test-img || true
 	docker rm test-img || true

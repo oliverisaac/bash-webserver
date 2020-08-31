@@ -11,12 +11,197 @@ LOG_LEVEL=trace
 LOG_IN_COLOR=true
 LOG_WITH_DATE=false
 
+export HTTP_ROOT="${HTTP_ROOT:-/var/www}"
+export HTTP_ROOT="${HTTP_ROOT%/}"
+
 function main()
 {
     info "Hello!"
     serve 80 handle
     wait
     return 0
+}
+
+
+function test_response_code_to_text(){
+    local in=200
+    local expect="OK"
+    result=$( response_code_to_text "$in" )
+    if [[ $result != $expect ]]; then
+        fatal "Failed response_code_to_text test: got: $result, expected: $expect"
+    fi
+}
+
+
+function handle(){
+    declare -A headers
+    response=""
+    code=500
+
+    function handle_error(){
+        code=500
+        printf "HTTP/1.1 %d %s\n" $code "$( response_code_to_text "$code" )"
+    }
+
+    function set_header(){
+        headers[$1]="${2:-}"
+    }
+
+    function set_response(){
+        response="$1"
+        set_header  "Content-Length" "${#response}"
+    }
+
+    function set_code(){
+        code="$1"
+    }
+
+    function send(){
+        trace "Going to send response"
+        {
+            printf "HTTP/1.1 %d %s\n" $code "$( response_code_to_text "$code" )"
+            for h in "${!headers[@]}"; do
+                printf "%s: %s\n" "$h" "${headers[$h]}"
+            done
+            printf "\n"
+            printf "%s" "$response"
+        } 
+    }
+
+    function get_path_relative_to_root(){
+        local root="${1%/}"
+        local path="${2#/}"
+
+        local new_path="${root}/${path}"
+        new_path=$( realpath "$new_path" )
+        if [[ $new_path/ != ${root}/* ]]; then
+            echo ""
+            return 1
+        fi
+        
+        echo "$new_path"
+        return 0
+    }
+
+    info "Handling connection"
+    for h in "${@}"; do
+        trace "Found request header: $h"
+    done
+
+    content=$( cat - )
+    debug "Content: $content"
+
+    if ! HTTP_SAFE_FILEPATH=$( get_path_relative_to_root "${HTTP_ROOT}" "${HTTP_PATH}" ); then
+        set_code 400
+        set_response "Invalid file path '$HTTP_PATH'"
+        send
+        return 0
+    fi
+
+    # handle a directory listing
+    if [[ -d ${HTTP_SAFE_FILEPATH} ]]; then
+        trace "$HTTP_SAFE_FILEPATH is a directory"
+        for f in index.sh index.html index.htm; do
+            if [[ -f "${HTTP_SAFE_FILEPATH%/}/$f" ]]; then
+                trace "Setting HTTP_SAFE_FILEPATH to $HTTP_SAFE_FILEPATH"
+                HTTP_SAFE_FILEPATH="${HTTP_SAFE_FILEPATH}/$f"
+                break
+            fi
+        done
+    fi
+
+    if [[ $HTTP_METHOD == "" ]]; then
+        trace "Empty HTTP METHOD"
+        set_code 500
+        set_response "Empty HTTP Method"
+        send
+        return 0
+    elif [[ -f $HTTP_SAFE_FILEPATH  ]]; then
+        if [[ $HTTP_SAFE_FILEPATH  == *.sh ]]; then
+            trace "Going to exec file $HTTP_SAFE_FILEPATH"
+            set_code 200
+            set_response "$( bash "$HTTP_SAFE_FILEPATH" )"
+            send
+        else
+            trace "Going to read file $HTTP_SAFE_FILEPATH"
+            set_code 200
+            set_response "$( cat "$HTTP_SAFE_FILEPATH" )"
+            send
+        fi
+    else
+        trace "File does not exist $HTTP_SAFE_FILEPATH"
+        set_code 404
+        set_header Content-Type "text/plain"
+        set_response "Not found: $HTTP_PATH"
+        send 
+    fi
+}
+
+function return_500(){
+    local code=500
+    printf "HTTP/1.1 %d %s\n" $code "$( response_code_to_text "$code" )"
+}
+
+function serve(){
+    local port="${1}"
+    local command="${2}"
+    info "Going to serve on port $port"
+
+    debug "Making fifos"
+    export SERVER_IN=$( mktemp --dry-run   server_in.XXXXXXX )
+    export SERVER_OUT=$( mktemp --dry-run server_out.XXXXXXX )
+
+    mkfifo "$SERVER_IN"
+    mkfifo "$SERVER_OUT"
+
+    trace "Made fifos: in: $( ls -altr "$SERVER_IN" )"
+    trace "Made fifos: out: $( ls -altr "$SERVER_OUT" )"
+
+    function handle_conn(){
+        content_length_regex='Content-Length: ([0-9]+)'
+        query_regex='(GET|PUT|POST|DELETE|PATCH) (.*) HTTP/1.1'
+        length=0
+
+        while true; do
+            debug "Attempting read..."
+            headers=()
+            export HTTP_METHOD=""
+            export HTTP_PATH=""
+            export HTTP_QUERY_STRING=""
+            while read -r line || [[ -n "$line" ]]; do
+                trace "Read: $line"
+                if [[ $line == $'\r' ]]; then
+                    break
+                fi
+                if [[ $line =~ $content_length_regex ]]; then
+                    length="${BASH_REMATCH[1]}"
+                    trace "Client sending content length of $length"
+                elif [[ $line =~ $query_regex ]]; then
+                    export HTTP_METHOD="${BASH_REMATCH[1]}"
+                    export HTTP_URL_STRING="${BASH_REMATCH[2]}"
+
+                    # If the URL string contains a question mark, then we split on that first question mark
+                    if [[ $HTTP_URL_STRING == *"?"* ]]; then
+                        export HTTP_PATH="${HTTP_URL_STRING%%\?*}"
+                        export HTTP_QUERY_STRING="${HTTP_URL_STRING#*\?}"
+                    else
+                        export HTTP_PATH="${HTTP_URL_STRING}"
+                        export HTTP_QUERY_STRING=""
+                    fi
+                fi
+                headers+=( "$line" )
+            done 
+            debug "Done reading headers"
+            trace HTTP_METHOD="$HTTP_METHOD"
+            trace HTTP_PATH="$HTTP_PATH"
+            trace HTTP_QUERY_STRING="$HTTP_QUERY_STRING"
+
+            if [[ $length -gt 0 ]]; then head -c "$length"; else printf -- ""; fi | "$command" "${headers[@]}" 
+            debug "Done running command $command"
+        done 
+    }
+
+    handle_conn < "$SERVER_OUT" | nc -l -k -p $port > "$SERVER_OUT"
 }
 
 function response_code_to_text(){
@@ -94,103 +279,6 @@ function response_code_to_text(){
    "
    resp_as_string=$( echo "$codes" | grep -Eie "^[[:space:]]*$code " )
    echo "${resp_as_string#*$code }"
-}
-
-function test_response_code_to_text(){
-    local in=200
-    local expect="OK"
-    result=$( response_code_to_text "$in" )
-    if [[ $result != $expect ]]; then
-        fatal "Failed response_code_to_text test: got: $result, expected: $expect"
-    fi
-}
-
-
-function handle(){
-    declare -A headers
-    response=""
-    code=500
-
-    function set_header(){
-        headers[$1]="${2:-}"
-    }
-
-    function set_response(){
-        response="$1"
-        set_header  "Content-Length" "${#response}"
-    }
-
-    function set_code(){
-        code="$1"
-    }
-
-    function send(){
-        trace "Going to send response"
-        {
-            printf "HTTP/1.1 %d %s\n" $code "$( response_code_to_text "$code" )"
-            for h in "${!headers[@]}"; do
-                printf "%s: %s\n" "$h" "${headers[$h]}"
-            done
-            printf "\n"
-            printf "%s" "$response"
-        } 
-    }
-
-    info "Handling connection"
-    for c in "${@}"; do
-        debug "Found line: $c"
-    done
-
-    content=$( cat - )
-    debug "Content: $content"
-
-    set_code 200
-    set_header Content-Type "text/plain"
-    set_response "ok"
-    send
-}
-
-function serve(){
-    local port="${1}"
-    local command="${2}"
-    info "Going to serve on port $port"
-
-    debug "Making fifos"
-    export SERVER_IN=$( mktemp --dry-run   server_in.XXXXXXX )
-    export SERVER_OUT=$( mktemp --dry-run server_out.XXXXXXX )
-
-    mkfifo "$SERVER_IN"
-    mkfifo "$SERVER_OUT"
-
-    trace "Made fifos: in: $( ls -altr "$SERVER_IN" )"
-    trace "Made fifos: out: $( ls -altr "$SERVER_OUT" )"
-
-    function handle_conn(){
-        content_length_regex='Content-Length: ([0-9]+)'
-        content=()
-        length=0
-
-        debug "Attempting read..."
-        while read -r line || [[ -n "$line" ]]; do
-            trace "Read: $line"
-            if [[ $line == $'\r' ]]; then
-                break
-            fi
-            if [[ $line =~ $content_length_regex ]]; then
-                length="${BASH_REMATCH[1]}"
-                trace "Client sending content length of $length"
-            fi
-            content+=( "$line" )
-        done 
-        debug "Done reading"
-        cat - | head -c "$length" | "$command" "${content[@]}" 
-        debug "Done running command $command"
-    }
-
-    while true; do
-        info "Going to listen on $port"
-        cat "$SERVER_OUT" | handle_conn | nc -l -p $port > "$SERVER_OUT"
-    done
 }
 
 export LOG_LEVEL_TRACE=90 LOG_LEVEL_DEBUG=70 LOG_LEVEL_INFO=50 LOG_LEVEL_WARN=30 LOG_LEVEL_ERROR=10 LOG_LEVEL_FATAL=0
