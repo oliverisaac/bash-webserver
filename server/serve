@@ -118,9 +118,14 @@ function handle(){
         return 0
     elif [[ -f $HTTP_SAFE_FILEPATH  ]]; then
         if [[ $HTTP_SAFE_FILEPATH  == *.sh ]]; then
-            trace "Going to exec file $HTTP_SAFE_FILEPATH"
+            trace "Going to run script $HTTP_SAFE_FILEPATH"
             set_code 200
             set_response "$( bash "$HTTP_SAFE_FILEPATH" )"
+            send
+        elif [[ -x $HTTP_SAFE_FILEPATH ]]; then
+            trace "Going to exec exe $HTTP_SAFE_FILEPATH"
+            set_code 200
+            set_response "$( "$HTTP_SAFE_FILEPATH" )"
             send
         else
             trace "Going to read file $HTTP_SAFE_FILEPATH"
